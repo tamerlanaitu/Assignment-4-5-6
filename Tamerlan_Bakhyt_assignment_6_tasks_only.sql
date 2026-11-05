@@ -1,3 +1,4 @@
+
 \set AUTOCOMMIT on
 \set ON_ERROR_STOP on
 \set ON_ERROR_ROLLBACK off
@@ -76,7 +77,7 @@ WITH uk_contacts (contact_type, organization, person, city) AS (
     SELECT 'Customer', company_name, contact_name, city
     FROM customers
     WHERE country = 'UK'
-    UNION ALL
+    UNION ALL --сохраняет все строки, даже если они повторяются
     SELECT 'Supplier', company_name, contact_name, city
     FROM suppliers
     WHERE country = 'UK'
@@ -89,20 +90,23 @@ SELECT contact_type, organization, person, city
 FROM uk_contacts
 ORDER BY contact_type, city, person;
 
+/* Q1: UNION ALL is required because contacts from different source tables
+   are separate people/organizations and must not be deduplicated. */
+
 -- Task 2
 
 SELECT country FROM suppliers
-INTERSECT
+INTERSECT --Показывает страны, в которых есть одновременно и поставщики, и клиенты
 SELECT country FROM customers
 ORDER BY country;
 
 SELECT country FROM customers
-EXCEPT
+EXCEPT --Показывает страны, где есть клиенты, но нет поставщиков
 SELECT country FROM suppliers
 ORDER BY country;
 
 SELECT city FROM suppliers
-UNION
+UNION --Объединяет города клиентов и поставщиков, удаляя дубликаты
 SELECT city FROM customers;
 
 SELECT city FROM suppliers
@@ -118,19 +122,40 @@ SELECT '2c UNION' AS query, COUNT(*) AS result_rows FROM distinct_places
 UNION ALL
 SELECT '2d UNION ALL', COUNT(*) FROM source_places;
 
+/* Q2: UNION removes duplicate cities, so 2c returns fewer rows than 2d.
+   Swapping the SELECTs in 2b changes EXCEPT to customers minus suppliers,
+   which returns countries with suppliers but no customers. */
+
 -- Task 3
 SELECT client.customer_id, client.company_name, client.country, client.phone
 FROM (
     SELECT customer_id
     FROM orders
     WHERE EXTRACT(YEAR FROM order_date) = 1997
-    EXCEPT
+    EXCEPT --Клиенты с заказами в 1997 году, но без заказов в 1998 году
     SELECT customer_id
     FROM orders
     WHERE EXTRACT(YEAR FROM order_date) = 1998
 ) AS lapsed
 JOIN customers AS client ON client.customer_id = lapsed.customer_id
 ORDER BY client.company_name;
+
+/* Q3: Yes. The same set can be expressed with NOT EXISTS: */
+/*
+SELECT c.customer_id, c.company_name, c.country, c.phone
+FROM customers AS c
+WHERE EXISTS (
+    SELECT 1 FROM orders AS o
+    WHERE o.customer_id = c.customer_id
+      AND EXTRACT(YEAR FROM o.order_date) = 1997
+)
+AND NOT EXISTS (
+    SELECT 1 FROM orders AS o
+    WHERE o.customer_id = c.customer_id
+      AND EXTRACT(YEAR FROM o.order_date) = 1998
+)
+ORDER BY c.company_name;
+*/
 
 -- Task 4
 WITH dated_orders AS (
@@ -141,15 +166,21 @@ WITH dated_orders AS (
 SELECT yr AS order_year, qtr AS order_quarter, COUNT(*) AS orders_cnt,
        ROUND(SUM(freight)::NUMERIC, 2) AS total_freight
 FROM dated_orders
-GROUP BY ROLLUP (yr, qtr)
+GROUP BY ROLLUP (yr, qtr) --создаёт несколько уровней итогов
 ORDER BY GROUPING(yr), yr NULLS LAST, GROUPING(qtr), qtr NULLS LAST;
 
 WITH report AS (
     SELECT EXTRACT(YEAR FROM order_date), EXTRACT(QUARTER FROM order_date)
     FROM orders
-    GROUP BY ROLLUP (EXTRACT(YEAR FROM order_date), EXTRACT(QUARTER FROM order_date))
+    GROUP BY ROLLUP (EXTRACT(YEAR FROM order_date), EXTRACT(QUARTER FROM order_date)) --создаёт несколько уровней итогов
 )
 SELECT COUNT(*) AS rollup_rows FROM report;
+
+/* Q4: ROLLUP(year, quarter) returns one row per existing year/quarter,
+   one subtotal per year, and one grand total. For the standard Northwind
+   data this is 12 rows; yearly subtotal rows have NULL quarter values.
+   ROLLUP(quarter, year) would subtotal by quarter first and then produce
+   year subtotals in a different hierarchy. */
 
 -- Task 5
 WITH sale_lines AS (
@@ -163,13 +194,16 @@ WITH sale_lines AS (
     SELECT category_name, yr, GROUPING(category_name) AS all_categories,
            GROUPING(yr) AS all_years, SUM(line_revenue) AS amount
     FROM sale_lines
-    GROUP BY CUBE (category_name, yr)
+    GROUP BY CUBE (category_name, yr) --создаёт все комбинации итогов
 )
 SELECT CASE all_categories WHEN 1 THEN 'All categories' ELSE category_name END AS category,
        CASE all_years WHEN 1 THEN 'All years' ELSE yr::TEXT END AS order_year,
        ROUND(amount, 2) AS revenue
 FROM cube_report
 ORDER BY all_categories, category_name NULLS LAST, all_years, yr NULLS LAST;
+
+/* Q5: GROUPING() distinguishes a rolled-up NULL from a real NULL value,
+   while COALESCE() cannot tell those cases apart. */
 
 -- Task 6
 WITH catalog AS (
@@ -185,8 +219,10 @@ GROUP BY GROUPING SETS ((category_name), (supplier_country), ())
 ORDER BY GROUPING(category_name), category_name NULLS LAST,
          GROUPING(supplier_country), supplier_country NULLS LAST;
 
--- Task 7
+/* Q6: UNION ALL could reproduce the three grouping levels, but GROUPING
+   SETS is clearer, keeps one aggregate query, and avoids repeating logic. */
 
+-- Task 7
 CREATE VIEW v_order_totals (order_id, customer_id, employee_id, order_date, order_total) AS
 SELECT purchase.order_id, purchase.customer_id, purchase.employee_id, purchase.order_date,
        ROUND(COALESCE(total.amount, 0), 2)
@@ -208,6 +244,9 @@ FROM customer_revenue AS summary
 JOIN customers AS customer USING (customer_id)
 ORDER BY summary.revenue_1997 DESC, customer.customer_id
 FETCH FIRST 5 ROWS ONLY;
+
+/* Q7: A regular view stores the query definition, not a separate result.
+   A new order is therefore visible through the view after it is committed. */
 
 -- Task 8
 
@@ -240,6 +279,13 @@ WHERE customer_id = 'AITU1';
 SELECT customer_id, country FROM v_uk_customers WHERE customer_id = 'AITU1';
 SELECT COUNT(*) AS rejected_customer_rows FROM customers WHERE customer_id = 'AITU2';
 
+/* Q8: The 8c error says the new row violates the view's CHECK OPTION because
+   country = 'France' does not satisfy the view predicate country = 'UK'.
+   The option prevents rows outside the view from being inserted or updated.
+   PostgreSQL can update v_uk_customers because it is a simple one-table view;
+   v_order_totals contains aggregation/lateral computation and is not directly
+   updatable. */
+
 -- Task 9
 
 CREATE MATERIALIZED VIEW mv_category_sales AS
@@ -269,6 +315,11 @@ FROM mv_category_sales WHERE category_name = 'Beverages';
 ROLLBACK;
 SELECT units_sold AS beverage_units_after_rollback
 FROM mv_category_sales WHERE category_name = 'Beverages';
+
+/* Q9: The value before REFRESH is the old materialized result; after REFRESH
+   it includes the inserted 100 units; after ROLLBACK the refresh and insert
+   are undone. A materialized view is preferable for expensive, read-heavy
+   reports when slightly stale data and refresh cost are acceptable. */
 
 CREATE TABLE orders_big AS
 SELECT g.n * 100000 + o.order_id AS order_id,
@@ -332,6 +383,17 @@ ORDER BY pg_relation_size(index_relation.oid) DESC, listed.indexname;
 SELECT pg_size_pretty(pg_relation_size('public.orders_big'::REGCLASS)) AS heap_size,
        pg_size_pretty(pg_total_relation_size('public.orders_big'::REGCLASS)) AS complete_size;
 
+/* Q10: The customer_id index should make the selective ALFKI query use an
+   Index Scan/Bitmap Index Scan instead of a sequential scan. The >= 'B'
+   predicate matches a large share of the table, so a sequential scan can be
+   cheaper. Selectivity is qualifying_rows / table_rows. */
+
+/* Q11: A composite index is ordered by its leftmost column, so it cannot be
+   fully used for a predicate on order_date alone. The partial index is smaller
+   because it stores only freight > 500 rows. An ordinary index on ship_city
+   would not match LOWER(ship_city) unless the expression is indexed. Indexes
+   consume storage and slow INSERT/UPDATE/DELETE operations. */
+
 -- Task 12
 SELECT product_id, units_in_stock AS starting_stock
 FROM products WHERE product_id IN (11, 42) ORDER BY product_id;
@@ -392,6 +454,11 @@ FROM products AS current_row
 JOIN a6_two_original_stock AS original USING (product_id)
 ORDER BY current_row.product_id;
 
+/* Q12: After the invalid product-999 insert, PostgreSQL aborts the current
+   transaction; later commands are rejected and COMMIT rolls the transaction
+   back. This demonstrates atomicity. SAVEPOINT lets the second item be rolled
+   back while keeping the order, first item, and stock update. */
+
 -- Task 13
 ALTER TABLE products
 ADD CONSTRAINT chk_units_in_stock CHECK (units_in_stock >= 0);
@@ -402,6 +469,37 @@ UPDATE products SET units_in_stock = units_in_stock - 100 WHERE product_id = 42;
 ROLLBACK;
 \set ON_ERROR_STOP on
 SELECT product_id, units_in_stock FROM products WHERE product_id = 42;
+
+/* Q13a: The CHECK violation prevents negative stock; ROLLBACK leaves the
+   database unchanged. This is consistency. */
+
+/* Q13b - reproduce in TWO separate psql/pgAdmin sessions.
+
+-- Session A, step 1:
+BEGIN; SELECT units_in_stock FROM products WHERE product_id = 1;
+-- Session B, step 2:
+UPDATE products SET units_in_stock = units_in_stock - 10 WHERE product_id = 1;
+-- Session A, step 3:
+SELECT units_in_stock FROM products WHERE product_id = 1; COMMIT;
+-- Session A, step 4:
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT units_in_stock FROM products WHERE product_id = 1;
+-- Session B, step 5:
+UPDATE products SET units_in_stock = units_in_stock + 10 WHERE product_id = 1;
+-- Session A, step 6:
+SELECT units_in_stock FROM products WHERE product_id = 1;
+-- Session A, step 7:
+UPDATE products SET units_in_stock = units_in_stock - 1 WHERE product_id = 1;
+ROLLBACK;
+
+Under READ COMMITTED, each statement can see newly committed data. Under
+REPEATABLE READ, Session A keeps its transaction snapshot, so the repeated
+SELECT sees the same value; PostgreSQL also protects against an unsafe
+concurrent update. */
+
+/* Q13c: Durability is provided by PostgreSQL's write-ahead log (WAL): changes
+   are written to durable log storage before COMMIT reports success, allowing
+   committed data to be recovered after a server crash. */
 
 BEGIN;
 DELETE FROM order_details WHERE order_id = 11078;
